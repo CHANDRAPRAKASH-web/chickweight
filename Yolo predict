@@ -1,0 +1,2 @@
+# predict on valid set and save images with boxes
+yolo predict model=runs/detect/train/weights/best.pt source=dataset/valid/images save=True device=cpu
