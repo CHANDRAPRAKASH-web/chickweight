@@ -1,0 +1,100 @@
+# debug_sample.py
+import argparse, numpy as np, pandas as pd, torch
+from pathlib import Path
+from PIL import Image
+import cv2
+from train_mlp import MLP
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--crop', required=True, help='crop filename (e.g. crop_00012.jpg) OR index (int)')
+parser.add_argument('--features', default='dataset/features/features.npy')
+parser.add_argument('--meta', default='dataset/crops/crops_meta.csv')
+parser.add_argument('--weights', default='weights.csv')
+parser.add_argument('--model', default='models/mlp.pth')
+args = parser.parse_args()
+
+# load
+X = np.load(args.features)   # N x D
+meta = pd.read_csv(args.meta) # must match rows of X (order matters)
+wdf = pd.read_csv(args.weights)
+wmap = dict(zip(wdf['filename'].astype(str), wdf['weight_g']))
+
+# find crop by name or index
+crop_arg = args.crop
+try:
+    idx = int(crop_arg)
+    if idx < 0 or idx >= len(meta):
+        raise ValueError("index out of range")
+    crop_row = meta.iloc[idx]
+    crop_index = idx
+except:
+    # find row with matching crop_filename
+    matches = meta.index[meta['crop_filename'] == crop_arg].tolist()
+    if not matches:
+        # try matching by prefix (remove rf suffix, extension differences)
+        alt = crop_arg.split('.rf.')[0] if '.rf.' in crop_arg else Path(crop_arg).stem
+        matches = meta.index[meta['crop_filename'].str.contains(alt)].tolist()
+    if not matches:
+        print("ERROR: crop not found in meta. Provided:", crop_arg)
+        print("Example meta rows (first 10):")
+        print(meta.head(10))
+        raise SystemExit(1)
+    crop_index = matches[0]
+    crop_row = meta.iloc[crop_index]
+
+print("Using crop index:", crop_index)
+print("Crop filename:", crop_row['crop_filename'])
+orig = str(crop_row.get('orig_image', 'MISSING'))
+print("Original image:", orig)
+
+# find true weight for that orig
+true_weight = None
+if orig in wmap:
+    true_weight = wmap[orig]
+else:
+    # fallback matching: try remove .rf.<hash> or use stem
+    key = orig.split('.rf.')[0] if '.rf.' in orig else Path(orig).name
+    candidates = [k for k in wmap.keys() if key in k or Path(k).stem == key or Path(k).name == key]
+    if candidates:
+        true_weight = wmap[candidates[0]]
+        print("Used fallback match key:", candidates[0])
+print("True weight (from weights.csv):", true_weight)
+
+# show crop exists
+crop_path = Path('dataset/crops')/crop_row['crop_filename']
+print("Crop path:", crop_path, "exists?", crop_path.exists())
+if crop_path.exists():
+    # show crop image size
+    im = Image.open(crop_path)
+    print("Crop size (w,h):", im.size)
+    # quick show mean pixel intensity
+    import numpy as np
+    arr = np.array(im)
+    print("Crop mean pixel value:", arr.mean())
+
+# model predict on feature row
+feat = X[crop_index].reshape(1, -1)
+device = torch.device('cpu')
+model = MLP(in_dim=feat.shape[1])
+model.load_state_dict(torch.load(args.model, map_location=device))
+model.eval()
+with torch.no_grad():
+    out = model(torch.tensor(feat, dtype=torch.float32)).numpy().item()
+print("Model raw output (pred):", out)
+
+# print ratio
+if true_weight is not None:
+    try:
+        ratio = out / float(true_weight)
+        print(f"pred/true = {ratio:.3f}")
+    except:
+        pass
+
+# also print a few neighbors (adjacent crops) to check ordering
+start = max(0, crop_index-2)
+end = min(len(meta)-1, crop_index+2)
+print("\nNeighbor crops (index, crop_filename, orig_image, weight_if_found):")
+for i in range(start, end+1):
+    o = meta.iloc[i].get('orig_image', '')
+    w = wmap.get(o, None)
+    print(i, meta.iloc[i]['crop_filename'], o, w)
