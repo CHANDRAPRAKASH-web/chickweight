@@ -1,0 +1,1 @@
+python extract_features.py --crops dataset/crops --out dataset/features
