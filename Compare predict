@@ -1,0 +1,50 @@
+import pandas as pd, numpy as np, re
+
+# === Load files ===
+weights = pd.read_csv("weights.csv")
+pred = pd.read_csv("predictions.csv")
+
+# --- aggregate predictions per image ---
+pred_img = pred.groupby("orig_image")["pred_g"].mean().reset_index()
+pred_img = pred_img.rename(columns={"pred_g": "predicted_g"})
+
+# --- join actual weights ---
+df = pd.merge(weights, pred_img, left_on="filename", right_on="orig_image", how="inner")
+
+# --- compute errors ---
+df["error_g"] = df["predicted_g"] - df["weight_g"]
+df["error_abs_g"] = df["error_g"].abs()
+df["error_pct"] = 100 * df["error_abs_g"] / df["weight_g"]
+
+# --- extract day number from filename ---
+def get_day(name):
+    m = re.search(r"day[_\-]?(\d+)", str(name), flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+df["day"] = df["filename"].apply(get_day)
+
+# --- save per-image results ---
+df.to_csv("results_per_image.csv", index=False)
+
+# --- summary metrics ---
+mae = df["error_abs_g"].mean()
+mape = df["error_pct"].mean()
+rmse = np.sqrt((df["error_g"]**2).mean())
+
+print(f"✅ Evaluation Summary:")
+print(f"  Samples: {len(df)}")
+print(f"  MAE (g):  {mae:.2f}")
+print(f"  MAPE (%): {mape:.2f}")
+print(f"  RMSE (g): {rmse:.2f}")
+
+# --- group by day ---
+day_summary = (
+    df.groupby("day")[["weight_g", "predicted_g", "error_abs_g"]]
+    .agg(["mean", "min", "max"])
+    .round(2)
+)
+day_summary.to_csv("results_day_summary.csv")
+
+print("\n📄 Saved:")
+print(" - results_per_image.csv (full comparison)")
+print(" - results_day_summary.csv (average per day)")
