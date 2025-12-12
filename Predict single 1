@@ -1,0 +1,99 @@
+# predict_single.py
+import torch
+import numpy as np
+from PIL import Image
+from torchvision import transforms
+from ultralytics import YOLO
+import argparse
+from train_mlp import MLP
+import json
+
+# ---------------------------
+# Argument parser
+# ---------------------------
+parser = argparse.ArgumentParser()
+parser.add_argument("--image", type=str, required=True, help="Path to input image")
+args = parser.parse_args()
+
+img_path = args.image
+
+# ---------------------------
+# Load YOLO model
+# ---------------------------
+yolo = YOLO("runs/detect/train/weights/best.pt")
+
+# ---------------------------
+# Load MLP model and scaler
+# ---------------------------
+model = MLP(in_dim=512)
+model.load_state_dict(torch.load("models/mlp.pth", map_location="cpu"))
+model.eval()
+
+with open("models/scaler.json", "r") as f:
+    scaler = json.load(f)
+
+mean_vec = np.array(scaler["mean"])
+std_vec = np.array(scaler["std"])
+
+# ---------------------------
+# Preprocessing for feature extractor
+# ---------------------------
+tf = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
+
+# Load ResNet backbone
+import torchvision.models as models
+resnet = models.resnet18(pretrained=True)
+resnet = torch.nn.Sequential(*list(resnet.children())[:-1])
+resnet.eval()
+
+# ---------------------------
+# Step 1: YOLO detect
+# ---------------------------
+result = yolo(img_path)[0]
+
+if len(result.boxes) == 0:
+    print("❌ No chick detected in the image!")
+    exit()
+
+# If multiple, take the biggest box
+boxes = result.boxes.xyxy.cpu().numpy()
+areas = (boxes[:,2]-boxes[:,0]) * (boxes[:,3]-boxes[:,1])
+best_box = boxes[areas.argmax()]
+
+x1, y1, x2, y2 = best_box.astype(int)
+
+# ---------------------------
+# Step 2: Crop chick
+# ---------------------------
+img = Image.open(img_path).convert('RGB')
+crop = img.crop((x1, y1, x2, y2))
+
+# ---------------------------
+# Step 3: Extract features
+# ---------------------------
+x = tf(crop).unsqueeze(0)
+with torch.no_grad():
+    feat = resnet(x).squeeze().numpy()
+
+# Scale
+feat_scaled = (feat - mean_vec) / std_vec
+
+# ---------------------------
+# Step 4: Predict weight
+# ---------------------------
+x_tensor = torch.tensor(feat_scaled, dtype=torch.float32).unsqueeze(0)
+pred = model(x_tensor).item()
+
+print("\n---------------------------")
+print(" 🐥 Chick Weight Prediction ")
+print("---------------------------")
+print(f"📷 Image: {img_path}")
+print(f"📌 Predicted Weight: {pred:.2f} grams")
+print("---------------------------\n")
