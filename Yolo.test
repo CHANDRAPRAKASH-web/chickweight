@@ -1,0 +1,1 @@
+python detect_and_crop.py --model runs/detect/train/weights/best.pt --src dataset/test/images --out dataset/crops
