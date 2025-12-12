@@ -1,0 +1,139 @@
+# predict_single.py
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import torch
+import torchvision.transforms as T
+from PIL import Image, ImageDraw, ImageFont
+from ultralytics import YOLO
+import torchvision
+
+# --- MLP model (same as train_mlp.py) ---
+import torch.nn as nn
+class MLP(nn.Module):
+    def __init__(self, in_dim=512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256,128),
+            nn.ReLU(),
+            nn.Linear(128,1)
+        )
+    def forward(self,x):
+        return self.net(x).squeeze(1)
+
+# --- CLI ---
+parser = argparse.ArgumentParser()
+parser.add_argument('--image', required=True, help='path to input image')
+parser.add_argument('--yolo', default='yolov8n.pt', help='yolov8 weights or pretrained model (or "yolov8n.pt")')
+parser.add_argument('--mlp', default='models/mlp.pth', help='trained MLP weights')
+parser.add_argument('--scaler', default='models/scaler.json', help='optional scaler json with mean/std')
+parser.add_argument('--out', default='runs/predict_single', help='output folder for visualization')
+parser.add_argument('--device', default=None, help='cpu or cuda (auto if None)')
+args = parser.parse_args()
+
+# --- device ---
+if args.device:
+    device = torch.device(args.device)
+else:
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# --- create out dir ---
+out_dir = Path(args.out)
+out_dir.mkdir(parents=True, exist_ok=True)
+
+# --- load YOLO model (Ultralytics) ---
+y = YOLO(args.yolo)
+
+# --- load backbone (resnet18) for feature extraction ---
+resnet = torchvision.models.resnet18(pretrained=True)
+modules = list(resnet.children())[:-1]
+backbone = torch.nn.Sequential(*modules).to(device).eval()
+
+# --- transforms (match extract_features.py) ---
+tf = T.Compose([
+    T.Resize((224,224)),
+    T.ToTensor(),
+    T.Normalize(mean=[0.485,0.456,0.406],std=[0.229,0.224,0.225])
+])
+
+# --- load scaler if exists ---
+mean_vec = None
+std_vec = None
+if Path(args.scaler).exists():
+    with open(args.scaler, 'r') as f:
+        s = json.load(f)
+        # expects {"mean": [...], "std":[...]} or similar
+        mean_vec = np.array(s.get('mean', []), dtype=np.float32) if 'mean' in s else None
+        std_vec = np.array(s.get('std', []), dtype=np.float32) if 'std' in s else None
+
+# --- load MLP model ---
+mlp = MLP(in_dim=512).to(device)
+state = torch.load(args.mlp, map_location=device)
+mlp.load_state_dict(state)
+mlp.eval()
+
+# --- open image ---
+img_p = Path(args.image)
+if not img_p.exists():
+    raise FileNotFoundError(f'Image not found: {img_p}')
+pil = Image.open(img_p).convert('RGB')
+
+# --- run detection ---
+# returns a list of results (we used single image => results[0])
+results = y.predict(source=str(img_p), device=0 if device.type=='cuda' else 'cpu', imgsz=640, conf=0.3, verbose=False)
+res = results[0]
+
+# if no boxes
+if len(res.boxes) == 0:
+    print('No chicks detected in the image.')
+    exit(0)
+
+# prepare visualization
+draw = ImageDraw.Draw(pil)
+try:
+    font = ImageFont.truetype("arial.ttf", 18)
+except:
+    font = ImageFont.load_default()
+
+preds = []
+for i,box in enumerate(res.boxes):
+    # box.xyxy -> tensor [x1,y1,x2,y2]
+    xyxy = box.xyxy[0].cpu().numpy()
+    x1,y1,x2,y2 = map(int, xyxy.tolist())
+    crop = pil.crop((x1,y1,x2,y2))
+    # feature
+    x = tf(crop).unsqueeze(0).to(device)
+    with torch.no_grad():
+        feat = backbone(x).squeeze().cpu().numpy().reshape(-1)  # 512
+    # scale if scaler provided
+    feat_scaled = feat
+    if mean_vec is not None and std_vec is not None and len(mean_vec)==feat.shape[0]:
+        feat_scaled = (feat - mean_vec) / (std_vec + 1e-8)
+    # predict
+    with torch.no_grad():
+        inp = torch.tensor(feat_scaled, dtype=torch.float32, device=device).unsqueeze(0)
+        out = mlp(inp).cpu().numpy().item()
+    preds.append((i+1, (x1,y1,x2,y2), out))
+    # draw box + label
+    label = f'Chick-{i+1}: {out:.1f}g'
+    draw.rectangle([x1,y1,x2,y2], outline='red', width=2)
+    text_w, text_h = draw.textsize(label, font=font)
+    draw.rectangle([x1, y1-text_h-4, x1+text_w+6, y1], fill='red')
+    draw.text((x1+3, y1-text_h-2), label, fill='white', font=font)
+
+# save visualization
+vis_path = out_dir / f'pred_{img_p.stem}.jpg'
+pil.save(vis_path)
+print(f'Saved visualization -> {vis_path}')
+
+# print results summary
+for idx, bbox, pred_g in preds:
+    print(f'Chick {idx}: bbox={bbox} predicted_weight_g={pred_g:.2f}')
+
+# print minima/max/avg
+arr = np.array([p for (_,_,p) in preds])
+print(f'Min: {arr.min():.2f} g, Max: {arr.max():.2f} g, Avg: {arr.mean():.2f} g')
