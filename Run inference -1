@@ -1,0 +1,1 @@
+python inference.py --predict_all --features dataset/features/features.npy --meta dataset/crops/crops_meta.csv --model models/mlp.pth --scaler models/scaler.json --out models/predictions.csv
