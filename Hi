@@ -1,0 +1,21 @@
+# debug_quick.py - edit crop_index below and run
+import numpy as np, pandas as pd, torch
+from train_mlp import MLP
+
+crop_index = 12   # <<--- set this index to test
+X = np.load('dataset/features/features.npy')
+meta = pd.read_csv('dataset/crops/crops_meta.csv')
+wdf = pd.read_csv('weights.csv')
+wmap = dict(zip(wdf['filename'].astype(str), wdf['weight_g']))
+
+row = meta.iloc[crop_index]
+print("index", crop_index, "crop", row['crop_filename'], "orig", row.get('orig_image'))
+print("weight lookup:", wmap.get(row.get('orig_image')))
+
+feat = X[crop_index].reshape(1, -1)
+model = MLP(in_dim=feat.shape[1])
+model.load_state_dict(torch.load('models/mlp.pth', map_location='cpu'))
+model.eval()
+with torch.no_grad():
+    out = model(torch.tensor(feat, dtype=torch.float32)).numpy().item()
+print("pred", out)
