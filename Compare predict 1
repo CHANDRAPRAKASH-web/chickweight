@@ -1,0 +1,37 @@
+# compare_predictions.py
+import pandas as pd
+
+# ---- Load actual weights ----
+weights = pd.read_csv("weights.csv")
+weights['filename'] = weights['filename'].astype(str)
+
+# ---- Load predictions ----
+pred = pd.read_csv("models/predictions.csv")
+pred['orig_image'] = pred['orig_image'].astype(str)
+
+# ---- Merge on filename/orig_image ----
+merged = pd.merge(
+    pred,
+    weights,
+    left_on='orig_image',
+    right_on='filename',
+    how='inner'
+)
+
+# ---- Rename columns for clarity ----
+merged = merged.rename(columns={
+    "weight_g": "actual_weight_g",
+    "pred_g": "predicted_weight_g"
+})
+
+# ---- Compute errors ----
+merged["abs_error"] = (merged["predicted_weight_g"] - merged["actual_weight_g"]).abs()
+merged["pct_error"] = merged["abs_error"] / merged["actual_weight_g"] * 100
+
+# ---- Save results ----
+merged.to_csv("models/comparison_results.csv", index=False)
+
+print("\n✅ Comparison complete!")
+print("📄 Saved to: models/comparison_results.csv")
+print("\n📌 Preview:")
+print(merged.head())
