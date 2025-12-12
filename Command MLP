@@ -1,0 +1,1 @@
+python train_mlp.py --features dataset/features/features.npy --meta dataset/crops/crops_meta.csv --weights weights.csv --out models --epochs 50 --batch 32 --lr 1e-3
