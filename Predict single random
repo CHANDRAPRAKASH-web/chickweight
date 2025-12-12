@@ -1,0 +1,1 @@
+python predict_single.py --image dataset/train/images/chick_day1_3_jpg_jpeg.rf.aad1270a5f6ef531f5ee4207ef6e2b1d.jpg
