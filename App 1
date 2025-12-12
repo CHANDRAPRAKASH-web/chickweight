@@ -1,0 +1,215 @@
+# app.py
+import io
+import json
+import logging
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from PIL import Image
+import numpy as np
+import torch
+import torchvision.transforms as transforms
+import torchvision.models as models
+from ultralytics import YOLO
+
+# ---- Config ----
+YOLO_MODEL_PATH = "yolov8n.pt"          # or path to your best.pt
+MLP_PATH = "models/mlp.pth"
+SCALER_PATH = "models/scaler.json"      # should contain {"mean": [...], "std": [...]}
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+RESNET_PRETRAINED = True                # True uses torchvision pretrained weights
+
+# ---- Logging ----
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("chicken-weight-api")
+
+# ---- App ----
+app = FastAPI(title="Chicken Weight Predictor")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---- Helper dataclass for response ----
+class PredictResponse(BaseModel):
+    pred_g: float
+    bbox: Optional[list] = None  # [x1, y1, x2, y2]
+
+# ---- Load YOLO ----
+log.info(f"Loading YOLO model from: {YOLO_MODEL_PATH}")
+try:
+    yolo_model = YOLO(YOLO_MODEL_PATH)
+    log.info("YOLO loaded.")
+except Exception as e:
+    log.exception("Failed to load YOLO model.")
+    raise
+
+# ---- Load ResNet backbone (remove final fc) ----
+log.info("Building ResNet backbone (for feature extraction)...")
+resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if RESNET_PRETRAINED else None)
+modules = list(resnet.children())[:-1]  # remove final fc
+backbone = torch.nn.Sequential(*modules).to(DEVICE)
+backbone.eval()
+log.info("Backbone ready.")
+
+# ---- Transforms (same used in extract_features.py) ----
+tf = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
+])
+
+# ---- Load scaler (mean/std) ----
+if Path(SCALER_PATH).exists():
+    try:
+        with open(SCALER_PATH, "r") as f:
+            sc = json.load(f)
+        mean_vec = np.array(sc.get("mean", []), dtype=np.float32)
+        std_vec = np.array(sc.get("std", []), dtype=np.float32)
+        if mean_vec.size == 0 or std_vec.size == 0:
+            log.warning("scaler.json missing mean/std keys; will fallback to no scaling.")
+            mean_vec = None
+            std_vec = None
+        else:
+            log.info("Loaded scaler mean/std from scaler.json.")
+    except Exception as e:
+        log.warning("Failed to parse scaler.json — will fallback to no scaling.")
+        mean_vec = None
+        std_vec = None
+else:
+    log.warning("scaler.json not found, will fallback to no scaling.")
+    mean_vec = None
+    std_vec = None
+
+# ---- Define MLP (must match the train_mlp.py architecture) ----
+import torch.nn as nn
+class MLP(nn.Module):
+    def __init__(self, in_dim=512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(1)
+
+# ---- Load MLP weights ----
+if not Path(MLP_PATH).exists():
+    raise FileNotFoundError(f"MLP model file not found: {MLP_PATH}")
+
+log.info(f"Loading MLP weights from: {MLP_PATH}")
+# Need to know in_dim size; assume 512 from ResNet18
+mlp = MLP(in_dim=512).to(DEVICE)
+mlp.load_state_dict(torch.load(MLP_PATH, map_location=DEVICE))
+mlp.eval()
+log.info("MLP loaded.")
+
+# ---- Utility functions ----
+def extract_feature_from_pil(img_pil: Image.Image) -> np.ndarray:
+    """
+    Input: PIL Image (RGB)
+    Output: 1D numpy array shape (512,)
+    """
+    img_t = tf(img_pil).unsqueeze(0).to(DEVICE)  # 1x3x224x224
+    with torch.no_grad():
+        feat = backbone(img_t)  # 1x512x1x1
+    feat = feat.squeeze().cpu().numpy().reshape(-1)  # (512,)
+    return feat
+
+def scale_feature(feat: np.ndarray) -> np.ndarray:
+    if mean_vec is None or std_vec is None:
+        # fallback: no scaling
+        return feat.astype(np.float32)
+    # ensure shapes align
+    if feat.shape[0] != mean_vec.shape[0]:
+        log.warning("Feature dim and scaler mean dim mismatch — skipping scaling.")
+        return feat.astype(np.float32)
+    return ((feat - mean_vec) / std_vec).astype(np.float32)
+
+# ---- Predict endpoint ----
+@app.post("/predict", response_model=PredictResponse)
+async def predict(file: UploadFile = File(...)):
+    """
+    Upload a single image (multipart/form-data) with key 'file'.
+    Returns predicted weight in grams and detected bbox (x1,y1,x2,y2).
+    """
+    # 1) read raw bytes
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Empty file uploaded")
+
+    # 2) open as PIL
+    try:
+        img = Image.open(io.BytesIO(contents)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Cannot parse image. Provide a valid image file.")
+
+    # 3) YOLO detect
+    try:
+        # ultralytics YOLO accepts PIL Image
+        # returns list-like of results
+        results = yolo_model(img)
+    except Exception as e:
+        log.exception("YOLO detection failure")
+        raise HTTPException(status_code=500, detail="YOLO detection failed")
+
+    if len(results) == 0 or len(results[0].boxes) == 0:
+        raise HTTPException(status_code=404, detail="No chick detected in image")
+
+    # For simplicity take first detection (highest confidence)
+    # results[0].boxes.xyxy gives tensor Nx4
+    box_tensor = results[0].boxes.xyxy  # shape (N,4)
+    # Choose box with highest confidence (ultralytics boxes also have conf if needed)
+    # But results[0].boxes.conf exists (if using newer ulralytics)
+    try:
+        confs = results[0].boxes.conf.cpu().numpy()
+        best_idx = int(np.argmax(confs))
+        x1, y1, x2, y2 = box_tensor[best_idx].cpu().numpy().astype(int).tolist()
+    except Exception:
+        # fallback: take first
+        x1, y1, x2, y2 = box_tensor[0].cpu().numpy().astype(int).tolist()
+
+    # clamp coordinates to image size
+    w, h = img.size
+    x1, x2 = max(0, min(x1, w-1)), max(0, min(x2, w-1))
+    y1, y2 = max(0, min(y1, h-1)), max(0, min(y2, h-1))
+
+    if x2 <= x1 or y2 <= y1:
+        raise HTTPException(status_code=500, detail="Invalid bbox from detector")
+
+    # 4) crop
+    crop = img.crop((x1, y1, x2, y2))
+
+    # 5) extract feature
+    try:
+        feat = extract_feature_from_pil(crop)  # (512,)
+    except Exception:
+        log.exception("Feature extraction failed")
+        raise HTTPException(status_code=500, detail="Feature extraction failed")
+
+    # 6) scale
+    feat_scaled = scale_feature(feat)  # (512,)
+
+    # 7) MLP prediction
+    feat_t = torch.tensor(feat_scaled, dtype=torch.float32).unsqueeze(0).to(DEVICE)  # 1x512
+    with torch.no_grad():
+        pred = mlp(feat_t).cpu().numpy().item()
+
+    # If your training predicted in grams already — return directly.
+    # Otherwise apply any inverse transform (none here).
+    return PredictResponse(pred_g=float(pred), bbox=[int(x1), int(y1), int(x2), int(y2)])
+
+# ---- Root ----
+@app.get("/")
+def root():
+    return {"status": "ok", "device": str(DEVICE)}
