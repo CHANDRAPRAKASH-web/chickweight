@@ -1,0 +1,172 @@
+# app.py
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from pydantic import BaseModel
+from ultralytics import YOLO
+from PIL import Image
+import io, json, os
+import numpy as np
+import torch
+import torchvision.transforms as T
+import torchvision
+from typing import List, Optional
+from pathlib import Path
+
+app = FastAPI(title="Chicken weight API")
+
+# ---------- Config (edit paths if needed) ----------
+YOLO_MODEL_PATH = "yolov8n.pt"         # or path to your trained detect model
+MLP_WEIGHTS = "models/mlp.pth"         # trained MLP
+SCALER_JSON = "models/scaler.json"     # scaler produced during train_mlp
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ---------------------------------------------------
+
+# Load detection model (yolov8)
+try:
+    yolo = YOLO(YOLO_MODEL_PATH)
+except Exception as e:
+    yolo = None
+    print("Warning: YOLO load failed:", e)
+
+# Build resnet backbone (same as used for feature extraction)
+resnet = torchvision.models.resnet18(weights=torchvision.models.ResNet18_Weights.IMAGENET1K_V1)
+modules = list(resnet.children())[:-1]
+backbone = torch.nn.Sequential(*modules).to(DEVICE)
+backbone.eval()
+
+# Small MLP definition (must match your train_mlp.MLP)
+class MLP(torch.nn.Module):
+    def __init__(self, in_dim=512):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(in_dim, 256),
+            torch.nn.ReLU(),
+            torch.nn.Linear(256, 128),
+            torch.nn.ReLU(),
+            torch.nn.Linear(128, 1)
+        )
+    def forward(self, x):
+        return self.net(x).squeeze(1)
+
+# Load MLP model
+if not Path(MLP_WEIGHTS).exists():
+    raise FileNotFoundError(f"MLP weights not found at: {MLP_WEIGHTS}")
+mlp = MLP(in_dim=512).to(DEVICE)
+mlp.load_state_dict(torch.load(MLP_WEIGHTS, map_location=DEVICE))
+mlp.eval()
+
+# Load scaler JSON if present
+scaler_mean = None
+scaler_std = None
+if Path(SCALER_JSON).exists():
+    with open(SCALER_JSON, "r") as f:
+        scaler = json.load(f)
+    # support multiple possible key names saved earlier
+    if "mean" in scaler and "scale" in scaler:
+        scaler_mean = np.array(scaler["mean"], dtype=np.float32)
+        scaler_std  = np.array(scaler["scale"], dtype=np.float32)
+    elif "mean_vec" in scaler and "std_vec" in scaler:
+        scaler_mean = np.array(scaler["mean_vec"], dtype=np.float32)
+        scaler_std  = np.array(scaler["std_vec"], dtype=np.float32)
+    elif "mean" in scaler and "std" in scaler:
+        scaler_mean = np.array(scaler["mean"], dtype=np.float32)
+        scaler_std  = np.array(scaler["std"], dtype=np.float32)
+    else:
+        print("Scaler JSON does not contain recognizable mean/std keys. Ignoring scaler.")
+else:
+    print("Scaler JSON not found, predictions may be wrong. Path:", SCALER_JSON)
+
+# transforms for cropping -> feature extractor
+tf = T.Compose([
+    T.Resize((224,224)),
+    T.ToTensor(),
+    T.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
+])
+
+def extract_feature_from_pil(pil_img: Image.Image):
+    x = tf(pil_img).unsqueeze(0).to(DEVICE)  # 1x3x224x224
+    with torch.no_grad():
+        feat = backbone(x)        # 1 x 512 x 1 x 1
+    feat = feat.squeeze().cpu().numpy().reshape(-1).astype(np.float32)  # (512,)
+    return feat
+
+# helper to apply scaler (if available)
+def apply_scaler(feat: np.ndarray):
+    if scaler_mean is None or scaler_std is None:
+        # no scaler - just return as-is (but warn)
+        return feat
+    # ensure shapes:
+    if feat.shape != scaler_mean.shape:
+        # attempt broadcasting if scaler_mean is 1D and matches feat
+        if feat.shape[0] == scaler_mean.shape[0]:
+            return (feat - scaler_mean) / (scaler_std + 1e-12)
+        else:
+            # Can't scale - shapes mismatch
+            raise ValueError(f"Feature vector shape {feat.shape} does not match scaler mean {scaler_mean.shape}")
+    return (feat - scaler_mean) / (scaler_std + 1e-12)
+
+# prediction helper
+def predict_from_crop(pil_crop: Image.Image):
+    feat = extract_feature_from_pil(pil_crop)         # 512
+    try:
+        feat_scaled = apply_scaler(feat)
+    except Exception as e:
+        # return an error
+        raise HTTPException(status_code=500, detail=f"Scaler error: {e}")
+    # to tensor
+    x = torch.tensor(feat_scaled, dtype=torch.float32).unsqueeze(0).to(DEVICE)  # 1x512
+    with torch.no_grad():
+        out = mlp(x).cpu().numpy().squeeze().item()
+    # clip negative to zero and round to integer grams
+    out = float(out)
+    out = max(0.0, out)
+    # round to nearest integer gram for friendly output
+    return int(round(out))
+
+class PredictResponse(BaseModel):
+    pred_g: int
+    bbox: Optional[List[int]] = None
+
+@app.post("/predict", response_model=PredictResponse)
+async def predict(file: UploadFile = File(...)):
+    # verify uploaded file type
+    contents = await file.read()
+    try:
+        img = Image.open(io.BytesIO(contents)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read image file: {e}")
+
+    # run YOLO detection
+    if yolo is None:
+        raise HTTPException(status_code=500, detail="YOLO model not loaded on server.")
+    try:
+        results = yolo(img)      # note: ultralytics accepts PIL Image
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"YOLO inference failed: {e}")
+
+    # results[0].boxes.xyxy is a tensor of boxes
+    boxes = results[0].boxes.xyxy if len(results) > 0 else None
+    if boxes is None or len(boxes) == 0:
+        # no detection: optionally try center crop fallback, but we return error for now
+        raise HTTPException(status_code=404, detail="No chick detected in the image")
+
+    # pick highest confidence detection
+    confs = results[0].boxes.conf.cpu().numpy()
+    best_idx = int(np.argmax(confs))
+    xyxy = results[0].boxes.xyxy[best_idx].cpu().numpy().astype(int)
+    x1,y1,x2,y2 = [int(v) for v in xyxy]
+    # safe crop clipping
+    W, H = img.size
+    x1 = max(0, min(x1, W-1)); x2 = max(0, min(x2, W-1))
+    y1 = max(0, min(y1, H-1)); y2 = max(0, min(y2, H-1))
+    if x2 <= x1 or y2 <= y1:
+        raise HTTPException(status_code=500, detail="Bad bounding box from detector")
+
+    crop = img.crop((x1, y1, x2, y2))
+    try:
+        pred_g = predict_from_crop(crop)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction error: {e}")
+
+    return PredictResponse(pred_g=pred_g, bbox=[x1,y1,x2,y2])
