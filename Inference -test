@@ -1,0 +1,1 @@
+python inference_pipeline.py --input dataset/valid/images/chick_day5_3.jpg --out runs/inference
