@@ -1,0 +1,85 @@
+# inference.py
+import numpy as np
+import pandas as pd
+import torch
+import argparse
+import json
+from pathlib import Path
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--features', default='dataset/features/features.npy')
+parser.add_argument('--meta', default='dataset/crops/crops_meta.csv')
+parser.add_argument('--model', default='models/mlp.pth')
+parser.add_argument('--scaler', default='models/scaler.json')
+parser.add_argument('--crop', default=None, help='crop filename (e.g. crop_00012.jpg)')
+parser.add_argument('--index', type=int, default=None, help='index into crops (0-based) to predict')
+parser.add_argument('--predict_all', action='store_true', help='predict for all crops and save CSV')
+parser.add_argument('--out', default='models/predictions.csv')
+args = parser.parse_args()
+
+# Load
+feat = np.load(args.features)  # N x D
+meta = pd.read_csv(args.meta)   # must have crop_filename, orig_image
+with open(args.scaler, 'r') as f:
+    scaler = json.load(f)
+y_mean = float(scaler['y_mean'])
+y_std  = float(scaler['y_std'])
+
+# Model structure must match training
+import torch.nn as nn
+class MLP(nn.Module):
+    def __init__(self, in_dim=512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256,128),
+            nn.ReLU(),
+            nn.Linear(128,1)
+        )
+    def forward(self,x):
+        return self.net(x).squeeze(1)
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = MLP(in_dim=feat.shape[1]).to(device)
+model.load_state_dict(torch.load(args.model, map_location=device))
+model.eval()
+
+def predict_row(x_np):
+    x = torch.tensor(x_np[None, :], dtype=torch.float32).to(device)
+    with torch.no_grad():
+        y_norm = model(x).cpu().numpy().reshape(-1)[0]
+    # un-normalize
+    y = y_norm * y_std + y_mean
+    return float(y)
+
+if args.predict_all:
+    rows = []
+    for i in range(feat.shape[0]):
+        pred = predict_row(feat[i])
+        fname = meta.iloc[i]['crop_filename'] if 'crop_filename' in meta.columns else f'idx_{i}'
+        orig = meta.iloc[i].get('orig_image', '')
+        rows.append({'index': i, 'crop_filename': fname, 'orig_image': orig, 'pred_g': pred})
+    df = pd.DataFrame(rows)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(args.out, index=False)
+    print('Saved predictions ->', args.out)
+    print(df.head())
+    raise SystemExit(0)
+
+# single item by crop filename or index
+if args.crop is not None:
+    try:
+        idx = meta.index[meta['crop_filename'] == args.crop][0]
+    except Exception:
+        raise SystemExit('Crop filename not found in meta')
+elif args.index is not None:
+    idx = int(args.index)
+else:
+    raise SystemExit('Provide --crop or --index or use --predict_all')
+
+pred_g = predict_row(feat[idx])
+print('index', idx, 'crop', meta.iloc[idx].get('crop_filename'), 'orig', meta.iloc[idx].get('orig_image'))
+print('predicted weight (g) =', round(pred_g, 2))
+
+# If original weight exists in weights.csv, show it (optional)
