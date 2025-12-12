@@ -1,0 +1,81 @@
+import torch
+import numpy as np
+from ultralytics import YOLO
+from PIL import Image
+from torchvision import transforms
+import torchvision
+import argparse
+from train_mlp import MLP
+import json
+import os
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--image", required=True, help="Path to 1 chick image")
+parser.add_argument("--yolo", default="runs/detect/train/weights/best.pt")
+parser.add_argument("--mlp", default="models/mlp.pth")
+parser.add_argument("--scaler", default="models/scaler.json")
+args = parser.parse_args()
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Load YOLO
+yolo = YOLO(args.yolo)
+
+# Load MLP model
+mlp = MLP(in_dim=512).to(device)
+mlp.load_state_dict(torch.load(args.mlp, map_location=device))
+mlp.eval()
+
+# Load scaler
+with open(args.scaler, "r") as f:
+    scaler = json.load(f)
+mean_vec = np.array(scaler["mean"])
+std_vec = np.array(scaler["std"])
+
+# ResNet18 backbone
+resnet = torchvision.models.resnet18(pretrained=True)
+resnet = torch.nn.Sequential(*list(resnet.children())[:-1]).to(device)
+resnet.eval()
+
+# Transform
+tf = transforms.Compose([
+    transforms.Resize((224,224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485,0.456,0.406],
+                         std=[0.229,0.224,0.225])
+])
+
+# ---------- PREDICT ----------
+img_path = args.image
+img = Image.open(img_path).convert("RGB")
+
+# YOLO detect
+result = yolo(img_path)[0]
+
+if len(result.boxes) == 0:
+    print("\n❌ No chick detected in the image")
+    exit()
+
+# Take FIRST box only (single chick)
+box = result.boxes[0]
+x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+
+# Crop chick
+crop = img.crop((x1, y1, x2, y2))
+
+# Extract features
+x = tf(crop).unsqueeze(0).to(device)
+with torch.no_grad():
+    feat = resnet(x).squeeze().cpu().numpy()
+
+# Scale
+feat_scaled = (feat - mean_vec) / std_vec
+feat_scaled = torch.tensor(feat_scaled, dtype=torch.float32).to(device).unsqueeze(0)
+
+# Predict weight
+with torch.no_grad():
+    pred_weight = mlp(feat_scaled).item()
+
+print("\n===========================")
+print(f" Predicted Weight: {pred_weight:.2f} g")
+print("===========================")
